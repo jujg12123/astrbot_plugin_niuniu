@@ -6,12 +6,7 @@ import time
 import json
 import sys
 import asyncio
-import base64
 from datetime import datetime
-from typing import Optional
-
-import aiohttp
-import aiofiles
 import pytz
 
 from astrbot.api.all import *
@@ -25,13 +20,12 @@ from niuniu_games import NiuniuGames
 PLUGIN_DIR = os.path.join('data', 'plugins', 'astrbot_plugin_niuniu')
 os.makedirs(PLUGIN_DIR, exist_ok=True)
 
-NIUNIU_LENGTHS_FILE = os.path.join('data', 'niuniu_lengths.yml')          # 主数据文件（包含签到字段）
+NIUNIU_LENGTHS_FILE = os.path.join('data', 'niuniu_lengths.yml')
 NIUNIU_TEXTS_FILE = os.path.join(PLUGIN_DIR, 'niuniu_game_texts.yml')
 LAST_ACTION_FILE = os.path.join(PLUGIN_DIR, 'last_actions.yml')
-PURCHASE_DATA_FILE = os.path.join(PLUGIN_DIR, 'purchase_counts.yml')      # 雇佣次数统计
+PURCHASE_DATA_FILE = os.path.join(PLUGIN_DIR, 'purchase_counts.yml')
 
 # 签到相关常量
-AVATAR_API = "http://q.qlogo.cn/headimg_dl?dst_uin={}&spec=640&img_type=jpg"
 WEALTH_LEVELS = [
     (0, "平民", 0.25),
     (500, "小资", 0.5),
@@ -41,11 +35,11 @@ WEALTH_LEVELS = [
 WEALTH_BASE_VALUES = {"平民": 100.0, "小资": 500.0, "富豪": 2000.0, "巨擘": 5000.0}
 BASE_INCOME = 100.0
 SHANGHAI_TZ = pytz.timezone("Asia/Shanghai")
+INTEREST_RATE_PER_MINUTE = 0.001  # 每分钟0.1%
 
-# ========== 插件主类 ==========
-@register("niuniu_plugin", "长安某", "牛牛插件（融合签到系统），包含注册牛牛、打胶、比划、签到、雇佣、存取款等功能", "5.0.0")
+
+@register("niuniu_plugin", "长安某", "牛牛插件（融合签到系统，纯文本版）", "5.1.0")
 class NiuniuPlugin(Star):
-    # 冷却时间常量（秒）
     COOLDOWN_10_MIN = 600
     COOLDOWN_30_MIN = 1800
     COMPARE_COOLDOWN = 600
@@ -54,69 +48,29 @@ class NiuniuPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
-        
-        # 加载文本配置
         self.niuniu_texts = self._load_niuniu_texts()
         self.last_actions = self._load_last_actions()
         self.admins = self._load_admins()
-        
-        # 初始化子模块
         self.shop = NiuniuShop(self)
         self.games = NiuniuGames(self)
-        
-        # 签到系统资源路径
-        self.font_path = os.path.join(PLUGIN_DIR, '请以你的名字呼唤我.ttf')
-        self.template_path = os.path.join(PLUGIN_DIR, 'card_template.html')
-        self.default_bg_path = os.path.join(PLUGIN_DIR, 'default_bg.jpg')
-        
-        # 异步HTTP会话
-        timeout = aiohttp.ClientTimeout(total=10)
-        self.session = aiohttp.ClientSession(timeout=timeout)
-        
-        # 加载HTML模板
-        self.html_template = self._load_template()
-        
-        # 雇佣次数统计缓存
         self.purchase_data = {}
-        
-        # 异步初始化
         asyncio.create_task(self._async_init())
 
     async def _async_init(self):
-        """异步初始化：加载数据、迁移旧数据"""
-        # 迁移主数据（确保所有用户字段完整）
         data = self._load_niuniu_lengths()
         migrated = self._migrate_all_data(data)
         if migrated:
             self._save_niuniu_lengths(data)
-        
-        # 加载雇佣次数
         await self._load_purchase_data()
-        
-        # 检查资源文件
-        self._check_resources()
-        
-        self.context.logger.info("牛牛签到融合插件初始化完成")
-
-    # ========== 资源检查 ==========
-    def _check_resources(self):
-        if not os.path.exists(self.font_path):
-            self.context.logger.warning(f"字体文件缺失: {self.font_path}")
-        if not os.path.exists(self.template_path):
-            self.context.logger.error(f"HTML模板文件缺失: {self.template_path}")
-        if not os.path.exists(self.default_bg_path):
-            self.context.logger.warning(f"默认背景图缺失: {self.default_bg_path}")
+        self.context.logger.info("牛牛签到融合插件（纯文本版）初始化完成")
 
     # ========== 数据迁移 ==========
     def _migrate_user_data(self, user_data: dict) -> dict:
-        """将旧版牛牛数据迁移至融合格式，返回迁移后的数据（原地修改）"""
-        # 确保必要字段存在
         if 'coins' in user_data:
             if isinstance(user_data['coins'], int):
                 user_data['coins'] = float(user_data['coins'])
         else:
             user_data['coins'] = 0.0
-        
         user_data.setdefault('bank', 0.0)
         user_data.setdefault('contractors', [])
         user_data.setdefault('contracted_by', None)
@@ -126,10 +80,10 @@ class NiuniuPlugin(Star):
         user_data.setdefault('length', 5)
         user_data.setdefault('hardness', 1)
         user_data.setdefault('items', {})
+        user_data.setdefault('last_interest_time', None)
         return user_data
 
     def _migrate_all_data(self, data: dict) -> bool:
-        """遍历所有群和用户执行迁移，返回是否有修改"""
         modified = False
         for group_id, group_data in data.items():
             if not isinstance(group_data, dict):
@@ -144,16 +98,13 @@ class NiuniuPlugin(Star):
                         modified = True
         return modified
 
-    # ========== 数据文件操作（重写以支持迁移） ==========
+    # ========== 数据文件操作 ==========
     def _load_niuniu_lengths(self):
         if not os.path.exists(NIUNIU_LENGTHS_FILE):
             self._create_niuniu_lengths_file()
-        
         try:
             with open(NIUNIU_LENGTHS_FILE, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}
-            
-            # 确保群数据结构正确
             for group_id in list(data.keys()):
                 group_data = data[group_id]
                 if not isinstance(group_data, dict):
@@ -179,12 +130,10 @@ class NiuniuPlugin(Star):
         except Exception as e:
             self.context.logger.error(f"保存失败: {str(e)}")
 
-    # ========== 雇佣次数数据 ==========
     async def _load_purchase_data(self):
         try:
-            async with aiofiles.open(PURCHASE_DATA_FILE, 'r', encoding='utf-8') as f:
-                content = await f.read()
-                self.purchase_data = yaml.safe_load(content) or {}
+            with open(PURCHASE_DATA_FILE, 'r', encoding='utf-8') as f:
+                self.purchase_data = yaml.safe_load(f.read()) or {}
         except FileNotFoundError:
             self.purchase_data = {}
         except Exception as e:
@@ -193,9 +142,8 @@ class NiuniuPlugin(Star):
 
     async def _save_purchase_data(self):
         try:
-            async with aiofiles.open(PURCHASE_DATA_FILE, 'w', encoding='utf-8') as f:
-                content = yaml.dump(self.purchase_data, allow_unicode=True)
-                await f.write(content)
+            with open(PURCHASE_DATA_FILE, 'w', encoding='utf-8') as f:
+                f.write(yaml.dump(self.purchase_data, allow_unicode=True))
         except Exception as e:
             self.context.logger.error(f"保存雇佣次数失败: {e}")
 
@@ -239,7 +187,7 @@ class NiuniuPlugin(Star):
                 'item': "{rank}. {name} ➜ {length}"
             },
             'menu': {
-                'default': """📜 牛牛菜单（融合签到版）：
+                'default': """📜 牛牛菜单（融合签到纯文本版）：
 🔹 注册牛牛 - 初始化你的牛牛
 🔹 打胶 - 提升牛牛长度
 🔹 开冲 / 停止开冲 / 飞飞机 - 挂机赚金币
@@ -249,6 +197,8 @@ class NiuniuPlugin(Star):
 🔹 牛牛商城 / 牛牛购买 / 牛牛背包 - 道具系统
 🔹 签到 - 每日签到领金币
 🔹 存款/取款 <金额> - 银行存取
+🔹 查询银行 - 查看存款及利率
+🔹 领取利息 - 结算累积利息
 🔹 购买/出售 @目标 - 雇佣/解雇玩家
 🔹 赎身 - 重获自由
 🔹 排行榜/财富榜 - 查看财富排行
@@ -327,7 +277,8 @@ class NiuniuPlugin(Star):
         user_data = group_data.setdefault(user_id, {
             'nickname': '', 'length': 0, 'hardness': 1,
             'coins': 0.0, 'bank': 0.0, 'contractors': [],
-            'contracted_by': None, 'last_sign': None, 'consecutive': 0, 'items': {}
+            'contracted_by': None, 'last_sign': None, 'consecutive': 0,
+            'items': {}, 'last_interest_time': None
         })
         user_data.update(updates)
         self._save_niuniu_lengths(data)
@@ -381,8 +332,6 @@ class NiuniuPlugin(Star):
         group_id = str(event.message_obj.group_id)
         group_data = self.get_group_data(group_id)
         msg = event.message_str.strip()
-        
-        # 插件开关命令
         if msg.startswith("牛牛开"):
             async for result in self._toggle_plugin(event, True):
                 yield result
@@ -395,15 +344,11 @@ class NiuniuPlugin(Star):
             async for result in self._show_menu(event):
                 yield result
             return
-        
         if not group_data.get('plugin_enabled', False):
             return
-        
         user_id = str(event.get_sender_id())
         user_data = self.get_user_data(group_id, user_id)
         is_rushing = user_data.get('is_rushing', False) if user_data else False
-        
-        # 开冲相关命令（不受is_rushing限制）
         if msg.startswith("开冲"):
             if is_rushing:
                 yield event.plain_result("❌ 你已经在开冲了")
@@ -425,8 +370,6 @@ class NiuniuPlugin(Star):
             async for result in self.games.fly_plane(event):
                 yield result
             return
-        
-        # 签到系统命令
         if msg.startswith("签到"):
             if is_rushing:
                 yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
@@ -455,6 +398,20 @@ class NiuniuPlugin(Star):
                     yield result
             else:
                 yield event.plain_result("请指定取款金额，例如：取款 100")
+            return
+        elif msg.startswith("查询银行") or msg.startswith("银行信息"):
+            if is_rushing:
+                yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
+                return
+            async for result in self.bank_info(event):
+                yield result
+            return
+        elif msg.startswith("领取利息"):
+            if is_rushing:
+                yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
+                return
+            async for result in self.claim_interest(event):
+                yield result
             return
         elif msg.startswith("购买"):
             if is_rushing:
@@ -491,8 +448,6 @@ class NiuniuPlugin(Star):
             async for result in self.sign_query(event):
                 yield result
             return
-        
-        # 牛牛原有命令
         handler_map = {
             "注册牛牛": self._register,
             "打胶": self._dajiao,
@@ -519,12 +474,13 @@ class NiuniuPlugin(Star):
             "牛牛菜单", "牛牛开", "牛牛关", "注册牛牛", "打胶", "我的牛牛",
             "比划比划", "牛牛排行", "牛牛商城", "牛牛购买", "牛牛背包",
             "开冲", "停止开冲", "飞飞机", "签到", "存款", "取款", "购买",
-            "出售", "赎身", "排行榜", "财富榜", "我的信息", "签到查询", "我的资产"
+            "出售", "赎身", "排行榜", "财富榜", "我的信息", "签到查询", "我的资产",
+            "查询银行", "银行信息", "领取利息"
         ]
         if any(msg.startswith(cmd) for cmd in niuniu_commands):
             yield event.plain_result("不许一个人偷偷玩牛牛")
 
-    # ========== 牛牛原有功能方法 ==========
+    # ========== 牛牛原有功能方法（完整版） ==========
     async def _toggle_plugin(self, event, enable):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
@@ -549,7 +505,8 @@ class NiuniuPlugin(Star):
             'length': random.randint(cfg.get('min_length', 3), cfg.get('max_length', 10)),
             'hardness': 1,
             'coins': 0.0, 'bank': 0.0, 'contractors': [],
-            'contracted_by': None, 'last_sign': None, 'consecutive': 0, 'items': {}
+            'contracted_by': None, 'last_sign': None, 'consecutive': 0, 'items': {},
+            'last_interest_time': None
         }
         self.update_user_data(group_id, user_id, user_data)
         text = self.niuniu_texts['register']['success'].format(
@@ -662,7 +619,6 @@ class NiuniuPlugin(Star):
         compare_records[target_id] = current_time
         compare_records['count'] = compare_count + 1
         self._save_last_actions(last_actions)
-        # 夺心魔蝌蚪罐头效果
         user_items = self.shop.get_user_items(group_id, user_id)
         if user_items.get("夺心魔蝌蚪罐头", 0) > 0:
             effect_chance = random.random()
@@ -763,7 +719,6 @@ class NiuniuPlugin(Star):
             text = random.choice(self.niuniu_texts['compare']['lose']).format(
                 loser=nickname, winner=target_data['nickname'], loss=loss
             )
-        # 硬度衰减
         if random.random() < 0.3:
             updated_user = {'hardness': max(1, user_data.get('hardness', 1) - 1)}
             self.update_user_data(group_id, user_id, updated_user)
@@ -874,7 +829,7 @@ class NiuniuPlugin(Star):
     async def _show_menu(self, event):
         yield event.plain_result(self.niuniu_texts['menu']['default'])
 
-    # ========== 签到系统功能方法 ==========
+    # ========== 签到系统功能方法（完整版） ==========
     def _get_wealth_info(self, user_data: dict) -> tuple:
         total = user_data.get('coins', 0.0) + user_data.get('bank', 0.0)
         for min_coin, name, rate in reversed(WEALTH_LEVELS):
@@ -921,101 +876,6 @@ class NiuniuPlugin(Star):
                 self.context.logger.warning(f"通过API获取用户信息({target_id})失败: {e}")
         return f"用户{target_id[-4:]}"
 
-    async def _image_to_base64(self, url: str) -> str:
-        try:
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    image_bytes = await response.read()
-                    encoded_string = base64.b64encode(image_bytes).decode('utf-8')
-                    return f"data:{response.headers.get('Content-Type', 'image/jpeg')};base64,{encoded_string}"
-                else:
-                    self.context.logger.error(f"下载图片失败 ({url})，状态码: {response.status}")
-                    return ""
-        except Exception as e:
-            self.context.logger.error(f"下载或转换图片时发生异常 ({url}): {e}")
-            return ""
-
-    def _file_to_base64(self, file_path: str) -> str:
-        if not os.path.exists(file_path):
-            return ""
-        try:
-            with open(file_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                return f"data:image/jpeg;base64,{encoded_string}"
-        except Exception as e:
-            self.context.logger.error(f"读取本地图片文件失败 ({file_path}): {e}")
-            return ""
-
-    def _load_template(self) -> str:
-        if os.path.exists(self.template_path):
-            try:
-                with open(self.template_path, 'r', encoding='utf-8') as f:
-                    return f.read()
-            except Exception as e:
-                self.context.logger.error(f"读取HTML模板文件失败: {e}")
-        return "<h1>模板文件加载失败</h1>"
-
-    async def _generate_card_html(self, event: AstrMessageEvent, is_query: bool,
-                                  is_penalized: bool = False, original_earned: float = 0.0) -> Optional[str]:
-        bg_api_url = self.config.get("bg_api_url", "https://t.alcy.cc/ycy")
-        bg_image_data = await self._image_to_base64(bg_api_url)
-        if not bg_image_data:
-            bg_image_data = self._file_to_base64(self.default_bg_path)
-        group_id = str(event.message_obj.group_id)
-        user_id = str(event.get_sender_id())
-        user_data = self.get_user_data(group_id, user_id)
-        if not user_data:
-            return None
-        avatar_data = await self._image_to_base64(AVATAR_API.format(user_id))
-        font_path = f"file://{os.path.abspath(self.font_path)}" if os.path.exists(self.font_path) else ""
-        wealth_level, user_base_rate = self._get_wealth_info(user_data)
-        render_data = {
-            "font_path": font_path,
-            "bg_image_data": bg_image_data,
-            "avatar_data": avatar_data,
-            "user_id": user_id,
-            "user_name": event.get_sender_name(),
-            "status": "受雇" if user_data.get('contracted_by') else "自由",
-            "wealth_level": wealth_level,
-            "time_title": "查询时间" if is_query else "签到时间",
-            "current_time": datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-            "income_title": "明日预计收入" if is_query else "今日总收益",
-            "coins": user_data.get('coins', 0.0),
-            "bank": user_data.get('bank', 0.0),
-            "consecutive": user_data.get('consecutive', 0),
-            "is_query": is_query,
-            "is_penalized": is_penalized,
-            "original_earned": original_earned,
-        }
-        if is_query:
-            names = [await self._get_user_name_from_platform(event, uid) for uid in user_data.get('contractors', [])]
-            render_data["contractors_display"] = ", ".join(names) if names else "无"
-            base_with_bonus = BASE_INCOME * (1 + user_base_rate)
-            contractor_dynamic_rates = self._get_total_contractor_rate(group_id, user_data.get('contractors', []))
-            contract_bonus = base_with_bonus * contractor_dynamic_rates
-            consecutive_bonus = 10 * user_data.get('consecutive', 0)
-            tomorrow_interest = user_data.get('bank', 0.0) * 0.01
-            render_data.update({
-                "total_income": base_with_bonus + contract_bonus + consecutive_bonus + tomorrow_interest,
-                "base_with_bonus": base_with_bonus,
-                "contract_bonus": contract_bonus,
-                "consecutive_bonus": consecutive_bonus,
-                "tomorrow_interest": tomorrow_interest,
-            })
-        else:
-            render_data["contractors_display"] = str(len(user_data.get('contractors', [])))
-            interest = user_data.get('bank', 0.0) * 0.01
-            earned = original_earned
-            if is_penalized:
-                income_rate = self.config.get("employed_income_rate", 0.7)
-                earned *= income_rate
-            render_data.update({"earned": earned + interest, "interest": interest})
-        try:
-            return await self.html_render(self.html_template, render_data)
-        except Exception as e:
-            self.context.logger.error(f"HTML 渲染失败: {e}")
-            return None
-
     async def sign_in(self, event: AstrMessageEvent):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
@@ -1040,8 +900,11 @@ class NiuniuPlugin(Star):
                 user_data['consecutive'] = 1
         else:
             user_data['consecutive'] = 1
-        interest = user_data.get('bank', 0.0) * 0.01
-        user_data['bank'] = user_data.get('bank', 0.0) + interest
+        interest_earned = await self._calculate_and_apply_interest(user_data)
+        if interest_earned > 0:
+            interest_msg = f"\n💰 银行利息：+{interest_earned:.2f} 金币"
+        else:
+            interest_msg = ""
         _, user_base_rate = self._get_wealth_info(user_data)
         contractor_dynamic_rates = self._get_total_contractor_rate(group_id, user_data.get('contractors', []))
         consecutive_bonus = 10 * (user_data.get('consecutive', 0) - 1)
@@ -1055,11 +918,18 @@ class NiuniuPlugin(Star):
         user_data['coins'] = user_data.get('coins', 0.0) + earned
         user_data['last_sign'] = now.replace(tzinfo=None).isoformat()
         self.update_user_data(group_id, user_id, user_data)
-        html_url = await self._generate_card_html(event, is_query=False, is_penalized=is_penalized, original_earned=original_earned)
-        if html_url:
-            yield event.image_result(html_url)
-        else:
-            yield event.plain_result("签到成功！但图片生成失败。")
+        msg_lines = [
+            f"✅ 签到成功！",
+            f"📅 连续签到：{user_data['consecutive']} 天",
+            f"💵 基础收益：{earned:.2f} 金币",
+        ]
+        if is_penalized:
+            msg_lines.append(f"⚠️ 受雇惩罚：原收益 {original_earned:.2f} → {earned:.2f}")
+        msg_lines.append(f"💰 当前现金：{user_data['coins']:.2f} 金币")
+        msg_lines.append(f"🏦 银行存款：{user_data['bank']:.2f} 金币")
+        if interest_msg:
+            msg_lines.append(interest_msg.strip())
+        yield event.plain_result("\n".join(msg_lines))
 
     async def deposit(self, event: AstrMessageEvent, amount_str: str):
         try:
@@ -1077,12 +947,14 @@ class NiuniuPlugin(Star):
             yield event.plain_result("请先注册牛牛")
             return
         if amount > user_data.get('coins', 0.0):
-            yield event.plain_result(f"现金不足，当前现金：{user_data.get('coins', 0.0):.1f}")
+            yield event.plain_result(f"现金不足，当前现金：{user_data.get('coins', 0.0):.2f}")
             return
         user_data['coins'] -= amount
         user_data['bank'] = user_data.get('bank', 0.0) + amount
+        if user_data.get('last_interest_time') is None:
+            user_data['last_interest_time'] = datetime.now(SHANGHAI_TZ).isoformat()
         self.update_user_data(group_id, user_id, user_data)
-        yield event.plain_result(f"成功存入 {amount:.1f} 金币到银行。")
+        yield event.plain_result(f"成功存入 {amount:.2f} 金币到银行。当前存款：{user_data['bank']:.2f}")
 
     async def withdraw(self, event: AstrMessageEvent, amount_str: str):
         try:
@@ -1100,12 +972,85 @@ class NiuniuPlugin(Star):
             yield event.plain_result("请先注册牛牛")
             return
         if amount > user_data.get('bank', 0.0):
-            yield event.plain_result(f"银行存款不足，当前存款：{user_data.get('bank', 0.0):.1f}")
+            yield event.plain_result(f"银行存款不足，当前存款：{user_data.get('bank', 0.0):.2f}")
             return
         user_data['bank'] -= amount
         user_data['coins'] = user_data.get('coins', 0.0) + amount
         self.update_user_data(group_id, user_id, user_data)
-        yield event.plain_result(f"成功取出 {amount:.1f} 金币。")
+        yield event.plain_result(f"成功取出 {amount:.2f} 金币。当前现金：{user_data['coins']:.2f}")
+
+    async def bank_info(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+        user_data = self.get_user_data(group_id, user_id)
+        if not user_data:
+            yield event.plain_result("请先注册牛牛")
+            return
+        bank_amount = user_data.get('bank', 0.0)
+        per_minute = bank_amount * INTEREST_RATE_PER_MINUTE
+        per_hour = per_minute * 60
+        per_day = per_hour * 24
+        last_time_str = user_data.get('last_interest_time')
+        if last_time_str:
+            last_time = datetime.fromisoformat(last_time_str)
+            if last_time.tzinfo is None:
+                last_time = SHANGHAI_TZ.localize(last_time)
+            now = datetime.now(SHANGHAI_TZ)
+            elapsed_minutes = (now - last_time).total_seconds() / 60
+            pending_interest = bank_amount * INTEREST_RATE_PER_MINUTE * elapsed_minutes
+        else:
+            pending_interest = 0.0
+        msg = (
+            f"🏦 银行账户信息\n"
+            f"存款余额：{bank_amount:.2f} 金币\n"
+            f"利率：每分钟 {INTEREST_RATE_PER_MINUTE*100:.2f}%（即每金币每分钟生息 0.001）\n"
+            f"每分钟收益：{per_minute:.4f} 金币\n"
+            f"每小时收益：{per_hour:.4f} 金币\n"
+            f"每日收益：{per_day:.4f} 金币\n"
+            f"待领取利息：{pending_interest:.4f} 金币"
+        )
+        yield event.plain_result(msg)
+
+    async def _calculate_and_apply_interest(self, user_data: dict) -> float:
+        bank_amount = user_data.get('bank', 0.0)
+        if bank_amount <= 0:
+            return 0.0
+        last_time_str = user_data.get('last_interest_time')
+        now = datetime.now(SHANGHAI_TZ)
+        if last_time_str:
+            try:
+                last_time = datetime.fromisoformat(last_time_str)
+                if last_time.tzinfo is None:
+                    last_time = SHANGHAI_TZ.localize(last_time)
+            except:
+                last_time = now
+        else:
+            last_time = now
+        elapsed_minutes = (now - last_time).total_seconds() / 60
+        if elapsed_minutes <= 0:
+            return 0.0
+        interest = bank_amount * INTEREST_RATE_PER_MINUTE * elapsed_minutes
+        if interest > 0:
+            user_data['coins'] = user_data.get('coins', 0.0) + interest
+            user_data['last_interest_time'] = now.isoformat()
+        return interest
+
+    async def claim_interest(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+        user_data = self.get_user_data(group_id, user_id)
+        if not user_data:
+            yield event.plain_result("请先注册牛牛")
+            return
+        if user_data.get('bank', 0.0) <= 0:
+            yield event.plain_result("银行存款为0，无法产生利息。")
+            return
+        interest = await self._calculate_and_apply_interest(user_data)
+        self.update_user_data(group_id, user_id, user_data)
+        if interest > 0:
+            yield event.plain_result(f"✅ 成功领取利息 {interest:.4f} 金币！当前现金：{user_data['coins']:.2f}")
+        else:
+            yield event.plain_result("暂无待领取的利息。")
 
     async def purchase_contractor(self, event: AstrMessageEvent):
         target_id = self.parse_at_target(event)
@@ -1244,16 +1189,35 @@ class NiuniuPlugin(Star):
         names = await asyncio.gather(*[self._get_user_name_from_platform(event, uid) for uid in user_ids])
         leaderboard_str = "💰 本群财富排行榜\n" + "-" * 20 + "\n"
         for rank, ((user_id, total), name) in enumerate(zip(sorted_users, names), 1):
-            leaderboard_str += f"第{rank}名: {name} - {total:.1f} 金币\n"
+            leaderboard_str += f"第{rank}名: {name} - {total:.2f} 金币\n"
         yield event.plain_result(leaderboard_str.strip())
 
     async def sign_query(self, event: AstrMessageEvent):
-        html_url = await self._generate_card_html(event, is_query=True)
-        if html_url:
-            yield event.image_result(html_url)
-        else:
-            yield event.plain_result("查询失败，图片生成服务出现问题。")
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+        user_data = self.get_user_data(group_id, user_id)
+        if not user_data:
+            yield event.plain_result("请先注册牛牛")
+            return
+        wealth_level, _ = self._get_wealth_info(user_data)
+        contractors = user_data.get('contractors', [])
+        contractor_names = []
+        for cid in contractors:
+            name = await self._get_user_name_from_platform(event, cid)
+            contractor_names.append(name)
+        employer = user_data.get('contracted_by')
+        employer_name = await self._get_user_name_from_platform(event, employer) if employer else "无"
+        msg = (
+            f"📋 {user_data['nickname']} 的签到信息\n"
+            f"💰 现金：{user_data.get('coins', 0.0):.2f} 金币\n"
+            f"🏦 存款：{user_data.get('bank', 0.0):.2f} 金币\n"
+            f"📊 财富等级：{wealth_level}\n"
+            f"📅 连续签到：{user_data.get('consecutive', 0)} 天\n"
+            f"👥 雇佣者：{employer_name}\n"
+            f"👤 雇员：{', '.join(contractor_names) if contractor_names else '无'}\n"
+            f"🕒 上次签到：{user_data.get('last_sign', '从未')}"
+        )
+        yield event.plain_result(msg)
 
     async def terminate(self):
-        await self.session.close()
-        self.context.logger.info("牛牛插件资源已释放")
+        pass
