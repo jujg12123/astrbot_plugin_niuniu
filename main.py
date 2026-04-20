@@ -38,7 +38,7 @@ SHANGHAI_TZ = pytz.timezone("Asia/Shanghai")
 INTEREST_RATE_PER_MINUTE = 0.001  # 每分钟0.1%
 
 
-@register("niuniu_plugin", "长安某", "牛牛插件（融合签到系统，纯文本版）", "5.1.0")
+@register("niuniu_plugin", "长安某", "牛牛插件（融合签到系统，纯文本版，去重）", "5.1.1")
 class NiuniuPlugin(Star):
     COOLDOWN_10_MIN = 600
     COOLDOWN_30_MIN = 1800
@@ -54,6 +54,11 @@ class NiuniuPlugin(Star):
         self.shop = NiuniuShop(self)
         self.games = NiuniuGames(self)
         self.purchase_data = {}
+        
+        # 消息去重缓存
+        self._processed_messages = set()
+        self._max_processed_cache = 2000  # 最大缓存消息ID数量
+        
         asyncio.create_task(self._async_init())
 
     async def _async_init(self):
@@ -62,7 +67,7 @@ class NiuniuPlugin(Star):
         if migrated:
             self._save_niuniu_lengths(data)
         await self._load_purchase_data()
-        self.context.logger.info("牛牛签到融合插件（纯文本版）初始化完成")
+        self.context.logger.info("牛牛签到融合插件（纯文本版，去重）初始化完成")
 
     # ========== 数据迁移 ==========
     def _migrate_user_data(self, user_data: dict) -> dict:
@@ -187,10 +192,10 @@ class NiuniuPlugin(Star):
                 'item': "{rank}. {name} ➜ {length}"
             },
             'menu': {
-                'default': """📜 牛牛菜单：
+                'default': """📜 牛牛菜单（融合签到纯文本版）：
 🔹 注册牛牛 - 初始化你的牛牛
 🔹 打胶 - 提升牛牛长度
-🔹 开冲 / 停止开冲 / 飞飞机 - 赚金币
+🔹 开冲 / 停止开冲 / 飞飞机 - 挂机赚金币
 🔹 我的牛牛 - 查看当前状态
 🔹 比划比划 @目标 - 发起对决
 🔹 牛牛排行 - 查看群排行榜
@@ -326,12 +331,36 @@ class NiuniuPlugin(Star):
                             return user_id
         return None
 
-    # ========== 事件处理 ==========
+    # ========== 事件处理（含消息去重） ==========
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
+        # 获取消息唯一ID进行去重
+        msg_id = None
+        try:
+            # 根据不同框架适配消息ID获取方式
+            if hasattr(event.message_obj, 'message_id'):
+                msg_id = event.message_obj.message_id
+            elif hasattr(event.message_obj, 'raw_message_id'):
+                msg_id = event.message_obj.raw_message_id
+            else:
+                # 降级：使用群号+用户ID+消息内容哈希
+                msg_id = f"{event.message_obj.group_id}_{event.get_sender_id()}_{hash(event.message_str)}"
+        except:
+            msg_id = f"{event.message_obj.group_id}_{event.get_sender_id()}_{time.time()}"
+        
+        if msg_id in self._processed_messages:
+            self.context.logger.debug(f"消息已处理，跳过: {msg_id}")
+            return
+        self._processed_messages.add(msg_id)
+        # 定期清理缓存，防止内存无限增长
+        if len(self._processed_messages) > self._max_processed_cache:
+            self._processed_messages.clear()
+
         group_id = str(event.message_obj.group_id)
         group_data = self.get_group_data(group_id)
         msg = event.message_str.strip()
+        
+        # 插件开关命令
         if msg.startswith("牛牛开"):
             async for result in self._toggle_plugin(event, True):
                 yield result
@@ -344,11 +373,15 @@ class NiuniuPlugin(Star):
             async for result in self._show_menu(event):
                 yield result
             return
+        
         if not group_data.get('plugin_enabled', False):
             return
+        
         user_id = str(event.get_sender_id())
         user_data = self.get_user_data(group_id, user_id)
         is_rushing = user_data.get('is_rushing', False) if user_data else False
+        
+        # 开冲相关命令（不受is_rushing限制）
         if msg.startswith("开冲"):
             if is_rushing:
                 yield event.plain_result("❌ 你已经在开冲了")
@@ -370,6 +403,8 @@ class NiuniuPlugin(Star):
             async for result in self.games.fly_plane(event):
                 yield result
             return
+        
+        # 签到系统命令
         if msg.startswith("签到"):
             if is_rushing:
                 yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
@@ -448,6 +483,8 @@ class NiuniuPlugin(Star):
             async for result in self.sign_query(event):
                 yield result
             return
+        
+        # 牛牛原有命令
         handler_map = {
             "注册牛牛": self._register,
             "打胶": self._dajiao,
@@ -731,7 +768,7 @@ class NiuniuPlugin(Star):
             "⚔️ 【牛牛对决结果】 ⚔️",
             f"🗡️ {nickname}: {self.format_length(old_u_len)} → {self.format_length(user_data['length'])}",
             f"🛡️ {target_data['nickname']}: {self.format_length(old_t_len)} → {self.format_length(target_data['length'])}",
-            f"📢 {text}"
+                       f"📢 {text}"
         ]
         special_event_triggered = False
         if abs(u_len - t_len) <= 5 and random.random() < 0.075:
@@ -1221,3 +1258,4 @@ class NiuniuPlugin(Star):
 
     async def terminate(self):
         pass
+```
