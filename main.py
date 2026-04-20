@@ -15,6 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from niuniu_shop import NiuniuShop
 from niuniu_games import NiuniuGames
 
+# ========== 常量定义 ==========
 PLUGIN_DIR = os.path.join('data', 'plugins', 'astrbot_plugin_niuniu')
 os.makedirs(PLUGIN_DIR, exist_ok=True)
 
@@ -35,12 +36,11 @@ SHANGHAI_TZ = pytz.timezone("Asia/Shanghai")
 INTEREST_RATE_PER_MINUTE = 0.001
 
 
-@register("niuniu_plugin", "长安某", "牛牛插件（融合签到系统，纯文本版，去重）", "5.1.1")
+@register("niuniu_plugin", "长安某", "牛牛插件（融合签到、雇员管理、转账）", "5.2.0")
 class NiuniuPlugin(Star):
     COOLDOWN_10_MIN = 600
     COOLDOWN_30_MIN = 1800
     COMPARE_COOLDOWN = 600
-    INVITE_LIMIT = 3
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -61,8 +61,9 @@ class NiuniuPlugin(Star):
         if migrated:
             self._save_niuniu_lengths(data)
         await self._load_purchase_data()
-        self.context.logger.info("牛牛签到融合插件（纯文本版，去重）初始化完成")
+        self.context.logger.info("牛牛插件 v5.2.0 初始化完成")
 
+    # ========== 数据迁移（新增 employee_earnings 字段） ==========
     def _migrate_user_data(self, user_data: dict) -> dict:
         if 'coins' in user_data:
             if isinstance(user_data['coins'], int):
@@ -79,6 +80,7 @@ class NiuniuPlugin(Star):
         user_data.setdefault('hardness', 1)
         user_data.setdefault('items', {})
         user_data.setdefault('last_interest_time', None)
+        user_data.setdefault('employee_earnings', {})  # 新增：记录每个雇员的累计收益
         return user_data
 
     def _migrate_all_data(self, data: dict) -> bool:
@@ -92,10 +94,11 @@ class NiuniuPlugin(Star):
                 if isinstance(user_data, dict):
                     old_keys = set(user_data.keys())
                     self._migrate_user_data(user_data)
-                    if old_keys != set(user_data.keys()) or isinstance(user_data.get('coins'), int):
+                    if old_keys != set(user_data.keys()):
                         modified = True
         return modified
 
+    # ========== 数据文件操作 ==========
     def _load_niuniu_lengths(self):
         if not os.path.exists(NIUNIU_LENGTHS_FILE):
             self._create_niuniu_lengths_file()
@@ -144,6 +147,7 @@ class NiuniuPlugin(Star):
         except Exception as e:
             self.context.logger.error(f"保存雇佣次数失败: {e}")
 
+    # ========== 文本配置加载 ==========
     def _load_niuniu_texts(self):
         default_texts = {
             'register': {
@@ -183,7 +187,7 @@ class NiuniuPlugin(Star):
                 'item': "{rank}. {name} ➜ {length}"
             },
             'menu': {
-                'default': """📜 牛牛菜单（融合签到纯文本版）：
+                'default': """📜 牛牛菜单 v5.2.0：
 🔹 注册牛牛 - 初始化你的牛牛
 🔹 打胶 - 提升牛牛长度
 🔹 开冲 / 停止开冲 / 飞飞机 - 挂机赚金币
@@ -192,11 +196,14 @@ class NiuniuPlugin(Star):
 🔹 牛牛排行 - 查看群排行榜
 🔹 牛牛商城 / 牛牛购买 / 牛牛背包 - 道具系统
 🔹 签到 - 每日签到领金币
-🔹 存款/取款 <金额> - 银行存取
+🔹 存款/取款 <金额> - 银行存取（存款自动结息）
 🔹 查询银行 - 查看存款及利率
 🔹 领取利息 - 结算累积利息
+🔹 转账 @目标 <金额> - 转出现金
 🔹 购买/出售 @目标 - 雇佣/解雇玩家
 🔹 赎身 - 重获自由
+🔹 我的雇员 - 查看雇员及收益
+🔹 领取雇员收益 - 收取雇员产出
 🔹 排行榜/财富榜 - 查看财富排行
 🔹 我的信息 - 查看签到状态
 🔹 牛牛开/关 - 管理插件"""
@@ -242,8 +249,7 @@ class NiuniuPlugin(Star):
             with open(os.path.join('data', 'cmd_config.json'), 'r', encoding='utf-8-sig') as f:
                 config = json.load(f)
                 return config.get('admins_id', [])
-        except Exception as e:
-            self.context.logger.error(f"加载管理员列表失败: {str(e)}")
+        except:
             return []
 
     def is_admin(self, user_id):
@@ -273,7 +279,7 @@ class NiuniuPlugin(Star):
             'nickname': '', 'length': 0, 'hardness': 1,
             'coins': 0.0, 'bank': 0.0, 'contractors': [],
             'contracted_by': None, 'last_sign': None, 'consecutive': 0,
-            'items': {}, 'last_interest_time': None
+            'items': {}, 'last_interest_time': None, 'employee_earnings': {}
         })
         user_data.update(updates)
         self._save_niuniu_lengths(data)
@@ -320,8 +326,10 @@ class NiuniuPlugin(Star):
                             return user_id
         return None
 
+    # ========== 事件处理（含消息去重） ==========
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
+        # 消息去重
         msg_id = None
         try:
             if hasattr(event.message_obj, 'message_id'):
@@ -332,7 +340,6 @@ class NiuniuPlugin(Star):
                 msg_id = f"{event.message_obj.group_id}_{event.get_sender_id()}_{hash(event.message_str)}"
         except:
             msg_id = f"{event.message_obj.group_id}_{event.get_sender_id()}_{time.time()}"
-        
         if msg_id in self._processed_messages:
             return
         self._processed_messages.add(msg_id)
@@ -342,7 +349,8 @@ class NiuniuPlugin(Star):
         group_id = str(event.message_obj.group_id)
         group_data = self.get_group_data(group_id)
         msg = event.message_str.strip()
-        
+
+        # 开关与菜单
         if msg.startswith("牛牛开"):
             async for result in self._toggle_plugin(event, True):
                 yield result
@@ -355,14 +363,15 @@ class NiuniuPlugin(Star):
             async for result in self._show_menu(event):
                 yield result
             return
-        
+
         if not group_data.get('plugin_enabled', False):
             return
-        
+
         user_id = str(event.get_sender_id())
         user_data = self.get_user_data(group_id, user_id)
         is_rushing = user_data.get('is_rushing', False) if user_data else False
-        
+
+        # 开冲系列
         if msg.startswith("开冲"):
             if is_rushing:
                 yield event.plain_result("❌ 你已经在开冲了")
@@ -384,7 +393,8 @@ class NiuniuPlugin(Star):
             async for result in self.games.fly_plane(event):
                 yield result
             return
-        
+
+        # 签到系统命令
         if msg.startswith("签到"):
             if is_rushing:
                 yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
@@ -428,6 +438,20 @@ class NiuniuPlugin(Star):
             async for result in self.claim_interest(event):
                 yield result
             return
+        elif msg.startswith("转账"):
+            if is_rushing:
+                yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
+                return
+            # 解析格式：转账 @目标 金额
+            target_id = self.parse_at_target(event)
+            parts = msg.split()
+            if target_id and len(parts) >= 2:
+                amount_str = parts[-1]
+                async for result in self.transfer(event, target_id, amount_str):
+                    yield result
+            else:
+                yield event.plain_result("格式：转账 @目标 金额")
+            return
         elif msg.startswith("购买"):
             if is_rushing:
                 yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
@@ -449,6 +473,20 @@ class NiuniuPlugin(Star):
             async for result in self.terminate_contract(event):
                 yield result
             return
+        elif msg.startswith("我的雇员") or msg.startswith("雇员列表"):
+            if is_rushing:
+                yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
+                return
+            async for result in self.show_employees(event):
+                yield result
+            return
+        elif msg.startswith("领取雇员收益"):
+            if is_rushing:
+                yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
+                return
+            async for result in self.claim_employee_earnings(event):
+                yield result
+            return
         elif msg.startswith("排行榜") or msg.startswith("财富榜"):
             if is_rushing:
                 yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
@@ -463,7 +501,8 @@ class NiuniuPlugin(Star):
             async for result in self.sign_query(event):
                 yield result
             return
-        
+
+        # 牛牛原有命令
         handler_map = {
             "注册牛牛": self._register,
             "打胶": self._dajiao,
@@ -489,13 +528,14 @@ class NiuniuPlugin(Star):
         niuniu_commands = [
             "牛牛菜单", "牛牛开", "牛牛关", "注册牛牛", "打胶", "我的牛牛",
             "比划比划", "牛牛排行", "牛牛商城", "牛牛购买", "牛牛背包",
-            "开冲", "停止开冲", "飞飞机", "签到", "存款", "取款", "购买",
+            "开冲", "停止开冲", "飞飞机", "签到", "存款", "取款", "转账", "购买",
             "出售", "赎身", "排行榜", "财富榜", "我的信息", "签到查询", "我的资产",
-            "查询银行", "银行信息", "领取利息"
+            "查询银行", "银行信息", "领取利息", "我的雇员", "雇员列表", "领取雇员收益"
         ]
         if any(msg.startswith(cmd) for cmd in niuniu_commands):
             yield event.plain_result("不许一个人偷偷玩牛牛")
 
+    # ========== 牛牛原有方法 ==========
     async def _toggle_plugin(self, event, enable):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
@@ -521,7 +561,7 @@ class NiuniuPlugin(Star):
             'hardness': 1,
             'coins': 0.0, 'bank': 0.0, 'contractors': [],
             'contracted_by': None, 'last_sign': None, 'consecutive': 0, 'items': {},
-            'last_interest_time': None
+            'last_interest_time': None, 'employee_earnings': {}
         }
         self.update_user_data(group_id, user_id, user_data)
         text = self.niuniu_texts['register']['success'].format(
@@ -612,6 +652,8 @@ class NiuniuPlugin(Star):
         if not target_data:
             yield event.plain_result(self.niuniu_texts['compare']['target_not_registered'])
             return
+
+        # 冷却检查
         last_actions = self._load_last_actions()
         compare_records = last_actions.setdefault(group_id, {}).setdefault(user_id, {})
         last_compare = compare_records.get(target_id, 0)
@@ -634,6 +676,8 @@ class NiuniuPlugin(Star):
         compare_records[target_id] = current_time
         compare_records['count'] = compare_count + 1
         self._save_last_actions(last_actions)
+
+        # 道具：夺心魔蝌蚪罐头
         user_items = self.shop.get_user_items(group_id, user_id)
         if user_items.get("夺心魔蝌蚪罐头", 0) > 0:
             effect_chance = random.random()
@@ -674,6 +718,7 @@ class NiuniuPlugin(Star):
                 self.shop.consume_item(group_id, user_id, "夺心魔蝌蚪罐头")
                 yield event.plain_result("\n".join(result_msg))
                 return
+
         u_len = user_data['length']
         t_len = target_data['length']
         u_hardness = user_data.get('hardness', 1)
@@ -682,9 +727,10 @@ class NiuniuPlugin(Star):
         length_factor = (u_len - t_len) / max(u_len, t_len) * 0.2 if max(u_len, t_len) > 0 else 0
         hardness_factor = (u_hardness - t_hardness) * 0.05
         win_prob = min(max(base_win + length_factor + hardness_factor, 0.2), 0.8)
+
         old_u_len = u_len
         old_t_len = t_len
-        result_msg = []  # 提前初始化，避免分支未定义
+
         if random.random() < win_prob:
             gain = random.randint(0, 3)
             loss = random.randint(1, 2)
@@ -720,33 +766,24 @@ class NiuniuPlugin(Star):
                 text += f"\n🎉 {nickname} 掠夺了 {stolen_length}cm！"
             if total_gain == 0:
                 text += f"\n{self.niuniu_texts['compare']['user_no_increase'].format(nickname=nickname)}"
-            result_msg = [
-                "⚔️ 【牛牛对决结果】 ⚔️",
-                f"🗡️ {nickname}: {self.format_length(old_u_len)} → {self.format_length(user_data['length'])}",
-                f"🛡️ {target_data['nickname']}: {self.format_length(old_t_len)} → {self.format_length(target_data['length'])}",
-                f"📢 {text}"
-            ]
         else:
             gain = random.randint(0, 3)
             loss = random.randint(1, 2)
             updated_target = {'length': target_data['length'] + gain}
             if self.shop.consume_item(group_id, user_id, "余震"):
                 self.update_user_data(group_id, target_id, updated_target)
-                result_msg = [f"🛡️ 【余震生效】{nickname} 未减少长度！"]
             else:
                 updated_user = {'length': max(1, user_data['length'] - loss)}
                 self.update_user_data(group_id, user_id, updated_user)
                 self.update_user_data(group_id, target_id, updated_target)
-                result_msg = [f"💔 {nickname} 减少 {loss}cm"]
             text = random.choice(self.niuniu_texts['compare']['lose']).format(
                 loser=nickname, winner=target_data['nickname'], loss=loss
             )
-            result_msg = [
-                "⚔️ 【牛牛对决结果】 ⚔️",
-                f"🗡️ {nickname}: {self.format_length(old_u_len)} → {self.format_length(user_data['length'])}",
-                f"🛡️ {target_data['nickname']}: {self.format_length(old_t_len)} → {self.format_length(target_data['length'])}",
-                f"📢 {text}"
-            ]
+
+        # 重新获取最新数据（修复显示不变问题）
+        user_data = self.get_user_data(group_id, user_id)
+        target_data = self.get_user_data(group_id, target_id)
+
         # 硬度衰减
         if random.random() < 0.3:
             updated_user = {'hardness': max(1, user_data.get('hardness', 1) - 1)}
@@ -754,6 +791,18 @@ class NiuniuPlugin(Star):
         if random.random() < 0.3:
             updated_target = {'hardness': max(1, target_data.get('hardness', 1) - 1)}
             self.update_user_data(group_id, target_id, updated_target)
+
+        # 再次获取最新数据以反映硬度变化
+        user_data = self.get_user_data(group_id, user_id)
+        target_data = self.get_user_data(group_id, target_id)
+
+        result_msg = [
+            "⚔️ 【牛牛对决结果】 ⚔️",
+            f"🗡️ {nickname}: {self.format_length(old_u_len)} → {self.format_length(user_data['length'])}",
+            f"🛡️ {target_data['nickname']}: {self.format_length(old_t_len)} → {self.format_length(target_data['length'])}",
+            f"📢 {text}"
+        ]
+
         # 特殊事件
         special_event_triggered = False
         if abs(u_len - t_len) <= 5 and random.random() < 0.075:
@@ -797,6 +846,7 @@ class NiuniuPlugin(Star):
                 self.shop.consume_item(group_id, target_id, "妙脆角")
             result_msg.append(self.niuniu_texts['compare']['double_loss'].format(nickname1=nickname, nickname2=target_data['nickname']))
             special_event_triggered = True
+
         yield event.plain_result("\n".join(result_msg))
 
     async def _show_status(self, event):
@@ -851,6 +901,7 @@ class NiuniuPlugin(Star):
     async def _show_menu(self, event):
         yield event.plain_result(self.niuniu_texts['menu']['default'])
 
+    # ========== 签到与金融方法 ==========
     def _get_wealth_info(self, user_data: dict) -> tuple:
         total = user_data.get('coins', 0.0) + user_data.get('bank', 0.0)
         for min_coin, name, rate in reversed(WEALTH_LEVELS):
@@ -893,8 +944,8 @@ class NiuniuPlugin(Star):
                         no_cache=True,
                     )
                     return resp.get("card") or resp.get("nickname", f"用户{target_id[-4:]}")
-            except Exception as e:
-                self.context.logger.warning(f"通过API获取用户信息({target_id})失败: {e}")
+            except Exception:
+                pass
         return f"用户{target_id[-4:]}"
 
     async def sign_in(self, event: AstrMessageEvent):
@@ -921,11 +972,10 @@ class NiuniuPlugin(Star):
                 user_data['consecutive'] = 1
         else:
             user_data['consecutive'] = 1
+
         interest_earned = await self._calculate_and_apply_interest(user_data)
-        if interest_earned > 0:
-            interest_msg = f"\n💰 银行利息：+{interest_earned:.2f} 金币"
-        else:
-            interest_msg = ""
+        interest_msg = f"\n💰 银行利息：+{interest_earned:.2f} 金币" if interest_earned > 0 else ""
+
         _, user_base_rate = self._get_wealth_info(user_data)
         contractor_dynamic_rates = self._get_total_contractor_rate(group_id, user_data.get('contractors', []))
         consecutive_bonus = 10 * (user_data.get('consecutive', 0) - 1)
@@ -936,9 +986,22 @@ class NiuniuPlugin(Star):
             income_rate = self.config.get("employed_income_rate", 0.7)
             earned *= income_rate
             is_penalized = True
+
         user_data['coins'] = user_data.get('coins', 0.0) + earned
         user_data['last_sign'] = now.replace(tzinfo=None).isoformat()
+
+        # 雇员收益累积（雇主）
+        employer_id = user_data.get('contracted_by')
+        if employer_id:
+            employer_data = self.get_user_data(group_id, employer_id)
+            if employer_data:
+                earnings = employer_data.get('employee_earnings', {})
+                earnings[user_id] = earnings.get(user_id, 0.0) + earned
+                employer_data['employee_earnings'] = earnings
+                self.update_user_data(group_id, employer_id, employer_data)
+
         self.update_user_data(group_id, user_id, user_data)
+
         msg_lines = [
             f"✅ 签到成功！",
             f"📅 连续签到：{user_data['consecutive']} 天",
@@ -967,6 +1030,8 @@ class NiuniuPlugin(Star):
         if not user_data:
             yield event.plain_result("请先注册牛牛")
             return
+        # 存款前先结算利息
+        await self._calculate_and_apply_interest(user_data)
         if amount > user_data.get('coins', 0.0):
             yield event.plain_result(f"现金不足，当前现金：{user_data.get('coins', 0.0):.2f}")
             return
@@ -1073,6 +1138,39 @@ class NiuniuPlugin(Star):
         else:
             yield event.plain_result("暂无待领取的利息。")
 
+    async def transfer(self, event: AstrMessageEvent, target_id: str, amount_str: str):
+        try:
+            amount = float(amount_str)
+            if amount <= 0:
+                yield event.plain_result("转账金额必须大于0。")
+                return
+        except ValueError:
+            yield event.plain_result("金额格式不正确，请使用：转账 @目标 金额")
+            return
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+        if user_id == target_id:
+            yield event.plain_result("不能转账给自己。")
+            return
+        sender_data = self.get_user_data(group_id, user_id)
+        receiver_data = self.get_user_data(group_id, target_id)
+        if not sender_data:
+            yield event.plain_result("请先注册牛牛")
+            return
+        if not receiver_data:
+            yield event.plain_result("对方尚未注册牛牛")
+            return
+        if sender_data.get('coins', 0.0) < amount:
+            yield event.plain_result(f"现金不足，当前现金：{sender_data.get('coins', 0.0):.2f}")
+            return
+        sender_data['coins'] -= amount
+        receiver_data['coins'] = receiver_data.get('coins', 0.0) + amount
+        self.update_user_data(group_id, user_id, sender_data)
+        self.update_user_data(group_id, target_id, receiver_data)
+        target_name = await self._get_user_name_from_platform(event, target_id)
+        yield event.plain_result(f"成功转账 {amount:.2f} 金币给 {target_name}。")
+
+    # ========== 雇佣相关 ==========
     async def purchase_contractor(self, event: AstrMessageEvent):
         target_id = self.parse_at_target(event)
         if not target_id:
@@ -1189,6 +1287,46 @@ class NiuniuPlugin(Star):
         self.update_user_data(group_id, user_id, user_data)
         employer_name = await self._get_user_name_from_platform(event, employer_id) if employer_id else "未知雇主"
         yield event.plain_result(f"赎身成功，消耗{cost:.1f}金币，重获自由！原雇主 {employer_name} 获得了补偿。")
+
+    # ========== 新增雇员管理 ==========
+    async def show_employees(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+        user_data = self.get_user_data(group_id, user_id)
+        if not user_data:
+            yield event.plain_result("请先注册牛牛")
+            return
+        contractors = user_data.get('contractors', [])
+        if not contractors:
+            yield event.plain_result("你还没有雇佣任何人。")
+            return
+        earnings = user_data.get('employee_earnings', {})
+        lines = ["👥 你的雇员列表："]
+        for cid in contractors:
+            name = await self._get_user_name_from_platform(event, cid)
+            earned = earnings.get(cid, 0.0)
+            lines.append(f"• {name} - 累计收益：{earned:.2f} 金币")
+        yield event.plain_result("\n".join(lines))
+
+    async def claim_employee_earnings(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+        user_data = self.get_user_data(group_id, user_id)
+        if not user_data:
+            yield event.plain_result("请先注册牛牛")
+            return
+        earnings = user_data.get('employee_earnings', {})
+        if not earnings:
+            yield event.plain_result("暂无雇员收益可领取。")
+            return
+        total = sum(earnings.values())
+        if total <= 0:
+            yield event.plain_result("暂无雇员收益可领取。")
+            return
+        user_data['coins'] = user_data.get('coins', 0.0) + total
+        user_data['employee_earnings'] = {}
+        self.update_user_data(group_id, user_id, user_data)
+        yield event.plain_result(f"成功领取雇员收益 {total:.2f} 金币，当前现金：{user_data['coins']:.2f}")
 
     async def wealth_leaderboard(self, event: AstrMessageEvent):
         group_id = str(event.message_obj.group_id)
