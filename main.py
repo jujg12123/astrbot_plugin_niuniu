@@ -11,12 +11,10 @@ import pytz
 
 from astrbot.api.all import *
 
-# 添加模块路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from niuniu_shop import NiuniuShop
 from niuniu_games import NiuniuGames
 
-# ========== 常量定义 ==========
 PLUGIN_DIR = os.path.join('data', 'plugins', 'astrbot_plugin_niuniu')
 os.makedirs(PLUGIN_DIR, exist_ok=True)
 
@@ -25,7 +23,6 @@ NIUNIU_TEXTS_FILE = os.path.join(PLUGIN_DIR, 'niuniu_game_texts.yml')
 LAST_ACTION_FILE = os.path.join(PLUGIN_DIR, 'last_actions.yml')
 PURCHASE_DATA_FILE = os.path.join(PLUGIN_DIR, 'purchase_counts.yml')
 
-# 签到相关常量
 WEALTH_LEVELS = [
     (0, "平民", 0.25),
     (500, "小资", 0.5),
@@ -35,7 +32,7 @@ WEALTH_LEVELS = [
 WEALTH_BASE_VALUES = {"平民": 100.0, "小资": 500.0, "富豪": 2000.0, "巨擘": 5000.0}
 BASE_INCOME = 100.0
 SHANGHAI_TZ = pytz.timezone("Asia/Shanghai")
-INTEREST_RATE_PER_MINUTE = 0.001  # 每分钟0.1%
+INTEREST_RATE_PER_MINUTE = 0.001
 
 
 @register("niuniu_plugin", "长安某", "牛牛插件（融合签到系统，纯文本版，去重）", "5.1.1")
@@ -54,11 +51,8 @@ class NiuniuPlugin(Star):
         self.shop = NiuniuShop(self)
         self.games = NiuniuGames(self)
         self.purchase_data = {}
-        
-        # 消息去重缓存
         self._processed_messages = set()
-        self._max_processed_cache = 2000  # 最大缓存消息ID数量
-        
+        self._max_processed_cache = 2000
         asyncio.create_task(self._async_init())
 
     async def _async_init(self):
@@ -69,7 +63,6 @@ class NiuniuPlugin(Star):
         await self._load_purchase_data()
         self.context.logger.info("牛牛签到融合插件（纯文本版，去重）初始化完成")
 
-    # ========== 数据迁移 ==========
     def _migrate_user_data(self, user_data: dict) -> dict:
         if 'coins' in user_data:
             if isinstance(user_data['coins'], int):
@@ -103,7 +96,6 @@ class NiuniuPlugin(Star):
                         modified = True
         return modified
 
-    # ========== 数据文件操作 ==========
     def _load_niuniu_lengths(self):
         if not os.path.exists(NIUNIU_LENGTHS_FILE):
             self._create_niuniu_lengths_file()
@@ -152,7 +144,6 @@ class NiuniuPlugin(Star):
         except Exception as e:
             self.context.logger.error(f"保存雇佣次数失败: {e}")
 
-    # ========== 文本配置加载 ==========
     def _load_niuniu_texts(self):
         default_texts = {
             'register': {
@@ -258,7 +249,6 @@ class NiuniuPlugin(Star):
     def is_admin(self, user_id):
         return str(user_id) in self.admins
 
-    # ========== 数据访问接口 ==========
     def get_group_data(self, group_id):
         group_id = str(group_id)
         data = self._load_niuniu_lengths()
@@ -297,7 +287,6 @@ class NiuniuPlugin(Star):
         self._save_niuniu_lengths(data)
         return group_data
 
-    # ========== 工具方法 ==========
     def format_length(self, length):
         if length >= 100:
             return f"{length/100:.2f}m"
@@ -331,28 +320,22 @@ class NiuniuPlugin(Star):
                             return user_id
         return None
 
-    # ========== 事件处理（含消息去重） ==========
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
-        # 获取消息唯一ID进行去重
         msg_id = None
         try:
-            # 根据不同框架适配消息ID获取方式
             if hasattr(event.message_obj, 'message_id'):
                 msg_id = event.message_obj.message_id
             elif hasattr(event.message_obj, 'raw_message_id'):
                 msg_id = event.message_obj.raw_message_id
             else:
-                # 降级：使用群号+用户ID+消息内容哈希
                 msg_id = f"{event.message_obj.group_id}_{event.get_sender_id()}_{hash(event.message_str)}"
         except:
             msg_id = f"{event.message_obj.group_id}_{event.get_sender_id()}_{time.time()}"
         
         if msg_id in self._processed_messages:
-            self.context.logger.debug(f"消息已处理，跳过: {msg_id}")
             return
         self._processed_messages.add(msg_id)
-        # 定期清理缓存，防止内存无限增长
         if len(self._processed_messages) > self._max_processed_cache:
             self._processed_messages.clear()
 
@@ -360,7 +343,6 @@ class NiuniuPlugin(Star):
         group_data = self.get_group_data(group_id)
         msg = event.message_str.strip()
         
-        # 插件开关命令
         if msg.startswith("牛牛开"):
             async for result in self._toggle_plugin(event, True):
                 yield result
@@ -381,7 +363,6 @@ class NiuniuPlugin(Star):
         user_data = self.get_user_data(group_id, user_id)
         is_rushing = user_data.get('is_rushing', False) if user_data else False
         
-        # 开冲相关命令（不受is_rushing限制）
         if msg.startswith("开冲"):
             if is_rushing:
                 yield event.plain_result("❌ 你已经在开冲了")
@@ -404,7 +385,6 @@ class NiuniuPlugin(Star):
                 yield result
             return
         
-        # 签到系统命令
         if msg.startswith("签到"):
             if is_rushing:
                 yield event.plain_result("❌ 牛牛快冲晕了，还做不了其他事情，要不先停止开冲？")
@@ -484,7 +464,6 @@ class NiuniuPlugin(Star):
                 yield result
             return
         
-        # 牛牛原有命令
         handler_map = {
             "注册牛牛": self._register,
             "打胶": self._dajiao,
@@ -517,7 +496,6 @@ class NiuniuPlugin(Star):
         if any(msg.startswith(cmd) for cmd in niuniu_commands):
             yield event.plain_result("不许一个人偷偷玩牛牛")
 
-    # ========== 牛牛原有功能方法（完整版） ==========
     async def _toggle_plugin(self, event, enable):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
@@ -706,6 +684,7 @@ class NiuniuPlugin(Star):
         win_prob = min(max(base_win + length_factor + hardness_factor, 0.2), 0.8)
         old_u_len = u_len
         old_t_len = t_len
+        result_msg = []  # 提前初始化，避免分支未定义
         if random.random() < win_prob:
             gain = random.randint(0, 3)
             loss = random.randint(1, 2)
@@ -741,6 +720,12 @@ class NiuniuPlugin(Star):
                 text += f"\n🎉 {nickname} 掠夺了 {stolen_length}cm！"
             if total_gain == 0:
                 text += f"\n{self.niuniu_texts['compare']['user_no_increase'].format(nickname=nickname)}"
+            result_msg = [
+                "⚔️ 【牛牛对决结果】 ⚔️",
+                f"🗡️ {nickname}: {self.format_length(old_u_len)} → {self.format_length(user_data['length'])}",
+                f"🛡️ {target_data['nickname']}: {self.format_length(old_t_len)} → {self.format_length(target_data['length'])}",
+                f"📢 {text}"
+            ]
         else:
             gain = random.randint(0, 3)
             loss = random.randint(1, 2)
@@ -756,20 +741,20 @@ class NiuniuPlugin(Star):
             text = random.choice(self.niuniu_texts['compare']['lose']).format(
                 loser=nickname, winner=target_data['nickname'], loss=loss
             )
+            result_msg = [
+                "⚔️ 【牛牛对决结果】 ⚔️",
+                f"🗡️ {nickname}: {self.format_length(old_u_len)} → {self.format_length(user_data['length'])}",
+                f"🛡️ {target_data['nickname']}: {self.format_length(old_t_len)} → {self.format_length(target_data['length'])}",
+                f"📢 {text}"
+            ]
+        # 硬度衰减
         if random.random() < 0.3:
             updated_user = {'hardness': max(1, user_data.get('hardness', 1) - 1)}
             self.update_user_data(group_id, user_id, updated_user)
         if random.random() < 0.3:
             updated_target = {'hardness': max(1, target_data.get('hardness', 1) - 1)}
             self.update_user_data(group_id, target_id, updated_target)
-        user_data = self.get_user_data(group_id, user_id)
-        target_data = self.get_user_data(group_id, target_id)
-        result_msg = [
-            "⚔️ 【牛牛对决结果】 ⚔️",
-            f"🗡️ {nickname}: {self.format_length(old_u_len)} → {self.format_length(user_data['length'])}",
-            f"🛡️ {target_data['nickname']}: {self.format_length(old_t_len)} → {self.format_length(target_data['length'])}",
-                       f"📢 {text}"
-        ]
+        # 特殊事件
         special_event_triggered = False
         if abs(u_len - t_len) <= 5 and random.random() < 0.075:
             result_msg.append("💥 双方势均力敌！")
@@ -866,7 +851,6 @@ class NiuniuPlugin(Star):
     async def _show_menu(self, event):
         yield event.plain_result(self.niuniu_texts['menu']['default'])
 
-    # ========== 签到系统功能方法（完整版） ==========
     def _get_wealth_info(self, user_data: dict) -> tuple:
         total = user_data.get('coins', 0.0) + user_data.get('bank', 0.0)
         for min_coin, name, rate in reversed(WEALTH_LEVELS):
@@ -1258,4 +1242,3 @@ class NiuniuPlugin(Star):
 
     async def terminate(self):
         pass
-```
