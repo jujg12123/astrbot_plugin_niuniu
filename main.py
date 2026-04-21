@@ -38,7 +38,7 @@ INTEREST_RATE_PER_MINUTE = 0.001
 EMPLOYEE_EARNINGS_RATE = 0.01
 
 
-@register("niuniu_plugin", "长安某", "牛牛插件 v5.3.1（市场下架、撅优化、出售限制）", "5.3.1")
+@register("niuniu_plugin", "长安某", "牛牛插件 v5.4.0（市场按群、合并转发、雇员10人）", "5.4.0")
 class NiuniuPlugin(Star):
     COOLDOWN_10_MIN = 600
     COOLDOWN_30_MIN = 1800
@@ -53,7 +53,7 @@ class NiuniuPlugin(Star):
         self.shop = NiuniuShop(self)
         self.games = NiuniuGames(self)
         self.purchase_data = {}
-        self.market_listings = []
+        self.market_listings = []  # 所有群的挂单，每条记录含group_id
         self._processed_messages = set()
         self._max_processed_cache = 2000
         asyncio.create_task(self._async_init())
@@ -66,7 +66,7 @@ class NiuniuPlugin(Star):
         await self._load_purchase_data()
         await self._load_market_data()
         asyncio.create_task(self._daily_ranking_reward_task())
-        self.context.logger.info("牛牛插件 v5.3.1 初始化完成")
+        self.context.logger.info("牛牛插件 v5.4.0 初始化完成")
 
     # ========== 数据迁移 ==========
     def _migrate_user_data(self, user_data: dict) -> dict:
@@ -160,6 +160,10 @@ class NiuniuPlugin(Star):
                     self.market_listings = yaml.safe_load(f.read()) or []
             else:
                 self.market_listings = []
+            # 确保每条记录都有group_id（旧数据兼容）
+            for listing in self.market_listings:
+                if 'group_id' not in listing:
+                    listing['group_id'] = 'unknown'
         except Exception as e:
             self.context.logger.error(f"加载市场数据失败: {e}")
             self.market_listings = []
@@ -211,7 +215,7 @@ class NiuniuPlugin(Star):
                 'item': "{rank}. {name} ➜ {length}"
             },
             'menu': {
-                'default': """📜 牛牛菜单 v5.3.1：
+                'default': """📜 牛牛菜单 v5.4.0：
 🔹 注册牛牛 - 初始化
 🔹 打胶 - 提升长度
 🔹 开冲/停止开冲/飞飞机 - 赚金币
@@ -223,13 +227,13 @@ class NiuniuPlugin(Star):
 🔹 存款/取款 <金额> - 银行
 🔹 查询银行/领取利息
 🔹 转账 @目标 <金额>
-🔹 购买/出售 @目标 - 雇佣
+🔹 购买/出售 @目标 - 雇佣（最多10人）
 🔹 赎身 - 重获自由
 🔹 我的雇员/领取雇员收益
 🔹 排行榜/财富榜 - 财富排行
-🔹 我的信息 - 签到状态
+🔹 我的信息 - 签到状态+牛牛长度+身价
 🔹 出售牛牛 <长度> <价格> - 挂单市场
-🔹 牛牛市场 - 查看挂单
+🔹 牛牛市场 - 查看本群挂单
 🔹 牛牛市场购买 <编号>
 🔹 下架牛牛 <编号> - 下架自己的挂单
 🔹 撅 @目标 - 付100金币夺取长度
@@ -353,6 +357,35 @@ class NiuniuPlugin(Star):
                         if re.search(re.escape(target_name), user_data['nickname'], re.IGNORECASE):
                             return user_id
         return None
+
+    # ========== QQ合并转发消息辅助方法 ==========
+    async def _send_forward_message(self, event: AstrMessageEvent, messages: list):
+        """
+        将多条消息以合并转发形式发送
+        :param event: 消息事件
+        :param messages: 消息内容列表，每条为字符串
+        """
+        if not messages:
+            return
+        # 构建转发节点
+        nodes = []
+        for i, content in enumerate(messages):
+            node = {
+                "type": "node",
+                "data": {
+                    "name": "牛牛插件",
+                    "uin": str(event.get_self_id()),
+                    "content": content
+                }
+            }
+            nodes.append(node)
+        # 使用框架的forward方法（如果支持）
+        if hasattr(event, 'forward'):
+            await event.forward(nodes)
+        else:
+            # 降级：逐条发送
+            for content in messages:
+                yield event.plain_result(content)
 
     # ========== 每日排行奖励定时任务 ==========
     async def _daily_ranking_reward_task(self):
@@ -686,10 +719,11 @@ class NiuniuPlugin(Star):
         last_time = last_actions.setdefault(group_id, {}).get(user_id, {}).get('dajiao', 0)
         on_cooldown, remaining = self.check_cooldown(last_time, self.COOLDOWN_10_MIN)
         result_msg = []
+        current_time = time.time()
         if on_cooldown and has_zhiming_rhythm:
             self.shop.consume_item(group_id, user_id, "致命节奏")
             result_msg.append(f"⚡ 触发致命节奏！{nickname} 无视冷却强行打胶！")
-            elapsed = self.COOLDOWN_30_MIN + 1
+            elapsed = self.COOLDOWN_30_MIN + 1  # 强制进入长冷却分支
         else:
             if on_cooldown and not has_zhiming_rhythm:
                 mins = int(remaining // 60) + 1
@@ -698,9 +732,8 @@ class NiuniuPlugin(Star):
                 )
                 yield event.plain_result(text)
                 return
-            elapsed = time.time() - last_time
+            elapsed = current_time - last_time
         change = 0
-        current_time = time.time()
         if elapsed < self.COOLDOWN_30_MIN:
             rand = random.random()
             if rand < 0.4:
@@ -720,7 +753,6 @@ class NiuniuPlugin(Star):
         if 'hardness' in locals():
             updated_data['hardness'] = user_data['hardness']
         self.update_user_data(group_id, user_id, updated_data)
-        last_actions = self._load_last_actions()
         last_actions.setdefault(group_id, {}).setdefault(user_id, {})['dajiao'] = current_time
         self._save_last_actions(last_actions)
         if change > 0:
@@ -1270,7 +1302,7 @@ class NiuniuPlugin(Star):
         target_name = await self._get_user_name_from_platform(event, target_id)
         yield event.plain_result(f"成功转账 {amount:.2f} 金币给 {target_name}。")
 
-    # ========== 雇佣相关 ==========
+    # ========== 雇佣相关（最大雇员10人） ==========
     async def purchase_contractor(self, event: AstrMessageEvent):
         target_id = self.parse_at_target(event)
         if not target_id:
@@ -1286,8 +1318,8 @@ class NiuniuPlugin(Star):
         if not employer_data or not target_data:
             yield event.plain_result("双方都需要注册牛牛")
             return
-        if len(employer_data.get('contractors', [])) >= 3:
-            yield event.plain_result("已达到最大雇佣数量（3人）。")
+        if len(employer_data.get('contractors', [])) >= 10:
+            yield event.plain_result("已达到最大雇佣数量（10人）。")
             return
         base_cost = self._calculate_dynamic_wealth_value(target_data, target_id)
         total_cost = base_cost
@@ -1388,7 +1420,7 @@ class NiuniuPlugin(Star):
         employer_name = await self._get_user_name_from_platform(event, employer_id) if employer_id else "未知雇主"
         yield event.plain_result(f"赎身成功，消耗{cost:.1f}金币，重获自由！原雇主 {employer_name} 获得了补偿。")
 
-    # ========== 新增雇员管理 ==========
+    # ========== 新增雇员管理（修复跨群问题） ==========
     async def show_employees(self, event: AstrMessageEvent):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
@@ -1414,6 +1446,7 @@ class NiuniuPlugin(Star):
         now = datetime.now(SHANGHAI_TZ)
         if not last_time_str:
             employer_data['employee_earnings_last_time'] = now.isoformat()
+            self.update_user_data(group_id, employer_id, employer_data)  # 确保保存
             return
         try:
             last_time = datetime.fromisoformat(last_time_str)
@@ -1421,6 +1454,7 @@ class NiuniuPlugin(Star):
                 last_time = SHANGHAI_TZ.localize(last_time)
         except:
             employer_data['employee_earnings_last_time'] = now.isoformat()
+            self.update_user_data(group_id, employer_id, employer_data)
             return
         elapsed_minutes = (now - last_time).total_seconds() / 60
         if elapsed_minutes <= 0:
@@ -1458,7 +1492,22 @@ class NiuniuPlugin(Star):
         self.update_user_data(group_id, user_id, user_data)
         yield event.plain_result(f"成功领取雇员收益 {total:.2f} 金币，当前现金：{user_data['coins']:.2f}")
 
-    # ========== 牛牛市场功能（修改：出售限制、下架功能） ==========
+    # ========== 牛牛市场功能（按群隔离，购买后重新编号） ==========
+    def _reindex_market_for_group(self, group_id: str):
+        """对指定群的挂单重新编号（1,2,3...）"""
+        group_listings = [l for l in self.market_listings if l['group_id'] == group_id]
+        # 按现有顺序重新分配ID
+        for idx, listing in enumerate(group_listings, start=1):
+            listing['id'] = idx
+        # 更新全局列表中的对应项
+        for i, l in enumerate(self.market_listings):
+            if l['group_id'] == group_id:
+                # 找到对应的新ID
+                for new_l in group_listings:
+                    if new_l['seller_id'] == l['seller_id'] and new_l['length'] == l['length'] and new_l['price'] == l['price']:
+                        self.market_listings[i]['id'] = new_l['id']
+                        break
+
     async def sell_length_market(self, event: AstrMessageEvent, msg: str):
         parts = msg.split()
         if len(parts) < 3:
@@ -1482,13 +1531,15 @@ class NiuniuPlugin(Star):
         if user_data['length'] < length_to_sell:
             yield event.plain_result(f"你的牛牛长度不足，当前长度：{self.format_length(user_data['length'])}")
             return
-        # 修改：确保剩余长度 >= 1
         if user_data['length'] - length_to_sell < 1:
             yield event.plain_result(f"出售后牛牛长度将低于1cm，请减少出售量。当前长度：{self.format_length(user_data['length'])}")
             return
         user_data['length'] -= length_to_sell
+        # 生成新ID：当前群最大ID+1
+        group_listings = [l for l in self.market_listings if l['group_id'] == group_id]
+        new_id = max([l['id'] for l in group_listings], default=0) + 1
         listing = {
-            'id': len(self.market_listings) + 1,
+            'id': new_id,
             'seller_id': user_id,
             'seller_name': user_data['nickname'],
             'length': length_to_sell,
@@ -1501,11 +1552,13 @@ class NiuniuPlugin(Star):
         yield event.plain_result(f"成功挂单！编号：{listing['id']}，出售 {self.format_length(length_to_sell)}，价格 {price:.2f} 金币")
 
     async def show_market(self, event: AstrMessageEvent):
-        if not self.market_listings:
-            yield event.plain_result("当前市场没有挂单。")
+        group_id = str(event.message_obj.group_id)
+        group_listings = [l for l in self.market_listings if l['group_id'] == group_id]
+        if not group_listings:
+            yield event.plain_result("当前本群市场没有挂单。")
             return
-        lines = ["📋 牛牛市场挂单列表："]
-        for l in self.market_listings:
+        lines = ["📋 本群牛牛市场挂单列表："]
+        for l in sorted(group_listings, key=lambda x: x['id']):
             lines.append(f"{l['id']}. {l['seller_name']} 出售 {self.format_length(l['length'])} 价格 {l['price']:.2f} 金币")
         yield event.plain_result("\n".join(lines))
 
@@ -1540,10 +1593,11 @@ class NiuniuPlugin(Star):
             self.update_user_data(group_id, listing['seller_id'], seller_data)
         self.update_user_data(group_id, user_id, buyer_data)
         self.market_listings.remove(listing)
+        # 重新编号
+        self._reindex_market_for_group(group_id)
         await self._save_market_data()
         yield event.plain_result(f"购买成功！获得 {self.format_length(listing['length'])}，花费 {listing['price']:.2f} 金币")
 
-    # 新增下架功能
     async def cancel_market_listing(self, event: AstrMessageEvent, listing_id_str: str):
         try:
             listing_id = int(listing_id_str)
@@ -1563,16 +1617,16 @@ class NiuniuPlugin(Star):
         if listing['seller_id'] != user_id:
             yield event.plain_result("你只能下架自己的挂单")
             return
-        # 退还长度
         seller_data = self.get_user_data(group_id, user_id)
         if seller_data:
             seller_data['length'] += listing['length']
             self.update_user_data(group_id, user_id, seller_data)
         self.market_listings.remove(listing)
+        self._reindex_market_for_group(group_id)
         await self._save_market_data()
         yield event.plain_result(f"成功下架编号 {listing_id} 的挂单，退还 {self.format_length(listing['length'])}")
 
-    # ========== 撅指令（修改：夺取长度保护） ==========
+    # ========== 撅指令 ==========
     async def jue(self, event: AstrMessageEvent, target_id: str):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
@@ -1588,14 +1642,11 @@ class NiuniuPlugin(Star):
         if user_data.get('coins', 0.0) < cost:
             yield event.plain_result(f"现金不足，需要 {cost:.0f} 金币")
             return
-        # 检查目标长度
         if target_data['length'] <= 1:
             yield event.plain_result("对方牛牛太短了，无法夺取长度！")
             return
-        # 扣除金币
         user_data['coins'] -= cost
         target_data['coins'] = target_data.get('coins', 0.0) + cost
-        # 夺取长度（随机1-20，但不能让目标长度<1）
         steal = random.randint(1, 20)
         actual_steal = min(steal, target_data['length'] - 1)
         target_data['length'] -= actual_steal
@@ -1632,6 +1683,7 @@ class NiuniuPlugin(Star):
             leaderboard_str += f"第{rank}名: {name} - {total:.2f} 金币\n"
         yield event.plain_result(leaderboard_str.strip())
 
+    # 修改：我的信息增加牛牛长度和身价
     async def sign_query(self, event: AstrMessageEvent):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
@@ -1647,8 +1699,11 @@ class NiuniuPlugin(Star):
             contractor_names.append(name)
         employer = user_data.get('contracted_by')
         employer_name = await self._get_user_name_from_platform(event, employer) if employer else "无"
+        worth = self._calculate_dynamic_wealth_value(user_data, user_id)
         msg = (
             f"📋 {user_data['nickname']} 的签到信息\n"
+            f"📏 牛牛长度：{self.format_length(user_data['length'])}\n"
+            f"💎 身价：{worth:.2f} 金币\n"
             f"💰 现金：{user_data.get('coins', 0.0):.2f} 金币\n"
             f"🏦 存款：{user_data.get('bank', 0.0):.2f} 金币\n"
             f"📊 财富等级：{wealth_level}\n"
